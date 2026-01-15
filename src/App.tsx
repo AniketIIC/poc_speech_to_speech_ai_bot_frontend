@@ -2,56 +2,63 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
 import "./App.css";
 
-type AudioPayload = {
-  audioChunkNo: number; // ignored for playback order; kept for parity
-  audio: string;
-  conversationId: string;
-};
-
-type PlayableChunk = {
-  audio: string;
-};
-
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? "http://localhost:5050";
-const AUDIO_SAMPLE_RATE = 44100;
+const SAMPLE_RATE = 24000;
+const CHUNK_MS = 2000;
+const SAMPLES_PER_CHUNK = Math.round((SAMPLE_RATE * CHUNK_MS) / 1000);
 
-const base64ToUint8Array = (base64: string): Uint8Array => {
-  const cleaned = base64.split(",").pop() ?? "";
-  const binary = atob(cleaned);
+const downsample = (
+  buffer: Float32Array,
+  inputRate: number,
+  outputRate: number
+) => {
+  if (outputRate === inputRate) return buffer;
+  const ratio = inputRate / outputRate;
+  const newLen = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLen);
+  let offset = 0;
+  for (let i = 0; i < newLen; i++) {
+    result[i] = buffer[Math.floor(offset)];
+    offset += ratio;
+  }
+  return result;
+};
+
+const floatTo16BitPCM = (input: Float32Array) => {
+  const output = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    let s = Math.max(-1, Math.min(1, input[i]));
+    output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return output;
+};
+
+const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+};
+
+const base64ToArrayBuffer = (b64: string) => {
+  const binary = atob(b64);
   const len = binary.length;
   const bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
-  return bytes;
+  return bytes.buffer;
 };
 
-const blobToBase64 = (blob: Blob) =>
-  new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const result = (reader.result as string) || "";
-      const cleaned = result.includes(",") ? result.split(",")[1] : result;
-      resolve(cleaned);
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-  });
-
-const createAudioBuffer = async (
-  base64Audio: string,
-  audioCtx: AudioContext
-) => {
-  const uint8 = base64ToUint8Array(base64Audio);
-  const view = new DataView(uint8.buffer);
-  const samples = uint8.byteLength / 4;
-  const float32 = new Float32Array(samples);
-  for (let i = 0; i < samples; i++) {
-    float32[i] = view.getFloat32(i * 4, true);
+const int16ToBase64 = (input: Int16Array) => {
+  const buffer = new ArrayBuffer(input.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < input.length; i++) {
+    view.setInt16(i * 2, input[i], true);
   }
-  const buffer = audioCtx.createBuffer(1, float32.length, AUDIO_SAMPLE_RATE);
-  buffer.copyToChannel(float32, 0);
-  return buffer;
+  return arrayBufferToBase64(buffer);
 };
 
 function App() {
@@ -61,18 +68,24 @@ function App() {
   const [statusMessage, setStatusMessage] = useState("Idle");
 
   const socketRef = useRef<Socket | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const playbackQueueRef = useRef<PlayableChunk[]>([]);
-  const playingRef = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const conversationIdRef = useRef<string | null>(null);
-  const pendingChunksRef = useRef(0);
-  const endRequestedRef = useRef(false);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const pendingSegmentsRef = useRef<Int16Array[]>([]);
+  const pendingSamplesRef = useRef(0);
+  const isSendingInputRef = useRef(false);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const playheadTimeRef = useRef(0);
 
-  const resetPlayback = useCallback(() => {
-    playbackQueueRef.current = [];
-    playingRef.current = false;
+  const ensureAudioContext = useCallback(async () => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    if (audioContextRef.current.state === "suspended") {
+      await audioContextRef.current.resume();
+    }
+    return audioContextRef.current;
   }, []);
 
   const resetAudioContext = useCallback(async () => {
@@ -86,85 +99,98 @@ function App() {
     }
   }, []);
 
-  const cleanupMedia = useCallback(() => {
-    pendingChunksRef.current = 0;
-    endRequestedRef.current = false;
-    if (mediaRecorderRef.current) {
+  const stopOutputPlayback = useCallback(() => {
+    activeSourcesRef.current.forEach((src) => {
       try {
-        if (mediaRecorderRef.current.state !== "inactive") {
-          mediaRecorderRef.current.stop();
-        }
+        src.stop();
       } catch {
-        // no-op
+        // ignore
       }
-    }
-    mediaRecorderRef.current = null;
+    });
+    activeSourcesRef.current = [];
+    playheadTimeRef.current = audioContextRef.current?.currentTime || 0;
+  }, []);
 
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+  const cleanupInput = useCallback(() => {
+    processorNodeRef.current?.disconnect();
+    processorNodeRef.current = null;
+    sourceNodeRef.current?.disconnect();
+    sourceNodeRef.current = null;
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((track) => track.stop());
+      micStreamRef.current = null;
     }
-
+    pendingSegmentsRef.current = [];
+    pendingSamplesRef.current = 0;
+    isSendingInputRef.current = false;
     setIsHolding(false);
   }, []);
 
-  const playNextChunk = useCallback(async () => {
-    if (playingRef.current) return;
-    const queue = playbackQueueRef.current;
-    if (!queue.length) return;
+  const drainInputChunks = useCallback((force = false) => {
+    const chunkSize = SAMPLES_PER_CHUNK;
+    while (
+      pendingSamplesRef.current >= chunkSize ||
+      (force && pendingSamplesRef.current > 0)
+    ) {
+      const targetLength = Math.min(chunkSize, pendingSamplesRef.current);
+      if (targetLength <= 0) break;
 
-    const next = queue.shift()!;
+      const chunk = new Int16Array(targetLength);
+      let offset = 0;
 
-    try {
-      const audioCtx =
-        audioContextRef.current ??
-        new AudioContext({
-          sampleRate: AUDIO_SAMPLE_RATE,
-        });
-      audioContextRef.current = audioCtx;
-      await audioCtx.resume();
+      while (offset < targetLength && pendingSegmentsRef.current.length) {
+        const segment = pendingSegmentsRef.current[0];
+        const toCopy = Math.min(segment.length, targetLength - offset);
+        chunk.set(segment.subarray(0, toCopy), offset);
+        offset += toCopy;
 
-      const buffer = await createAudioBuffer(next.audio, audioCtx);
-      const source = audioCtx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(audioCtx.destination);
+        if (toCopy === segment.length) {
+          pendingSegmentsRef.current.shift();
+        } else {
+          pendingSegmentsRef.current[0] = segment.subarray(toCopy);
+        }
+      }
 
-      playingRef.current = true;
-      source.onended = () => {
-        playingRef.current = false;
-        void playNextChunk();
-      };
-      source.start();
-    } catch (err) {
-      console.error("Failed to play audio chunk", err);
-      playingRef.current = false;
-      void playNextChunk();
+      pendingSamplesRef.current -= targetLength;
+      const payload = int16ToBase64(chunk);
+      socketRef.current?.emit("input_audio", { data: payload });
     }
   }, []);
 
-  const handleAudioEvent = useCallback(
-    (payload: AudioPayload) => {
-      console.log(payload.conversationId, conversationIdRef.current);
-      if (!payload?.conversationId) return;
-      if (payload.conversationId !== conversationIdRef.current) return;
-      if (!payload.audio) return;
+  const schedulePlayback = useCallback(
+    async (base64: string) => {
+      if (!base64) return;
+      const audioCtx = await ensureAudioContext();
+      const buf = base64ToArrayBuffer(base64);
+      const view = new DataView(buf);
+      const frames = view.byteLength / 2;
 
-      playbackQueueRef.current.push({
-        audio: payload.audio,
-      });
+      const audioBuffer = audioCtx.createBuffer(1, frames, SAMPLE_RATE);
+      const channel = audioBuffer.getChannelData(0);
+      for (let i = 0; i < frames; i++) {
+        channel[i] = view.getInt16(i * 2, true) / 32768;
+      }
 
-      void playNextChunk();
+      const src = audioCtx.createBufferSource();
+      src.buffer = audioBuffer;
+      src.connect(audioCtx.destination);
+      src.onended = () => {
+        activeSourcesRef.current = activeSourcesRef.current.filter(
+          (node) => node !== src
+        );
+      };
+
+      activeSourcesRef.current.push(src);
+
+      if (playheadTimeRef.current < audioCtx.currentTime + 0.01) {
+        playheadTimeRef.current = audioCtx.currentTime + 0.01;
+      }
+
+      src.start(playheadTimeRef.current);
+      playheadTimeRef.current += audioBuffer.duration;
     },
-    [playNextChunk]
+    [ensureAudioContext]
   );
-
-  const tryEmitEndStream = useCallback(() => {
-    if (!endRequestedRef.current) return;
-    if (pendingChunksRef.current > 0) return;
-    socketRef.current?.emit("end_stream");
-    endRequestedRef.current = false;
-    setStatusMessage("Stream ended");
-  }, []);
 
   useEffect(() => {
     const socket = io(SOCKET_URL, { transports: ["websocket"] });
@@ -179,42 +205,61 @@ function App() {
       setSocketConnected(false);
       setStatusMessage("Disconnected");
       setConversationId(null);
-      conversationIdRef.current = null;
-      resetPlayback();
-      void resetAudioContext();
-      cleanupMedia();
+      cleanupInput();
+      stopOutputPlayback();
     });
 
     socket.on("new_conversation", ({ data }) => {
       const nextConversation = data?.conversationId ?? null;
-      conversationIdRef.current = nextConversation;
-      console.log(conversationIdRef.current);
       setConversationId(nextConversation);
-      resetPlayback();
-      void resetAudioContext();
       setStatusMessage(
         nextConversation
           ? `New conversation: ${nextConversation}`
           : "Awaiting conversation"
       );
+      stopOutputPlayback();
     });
 
-    socket.on("audio", ({ data }) => handleAudioEvent(data as AudioPayload));
+    socket.on("ready", () => {
+      setStatusMessage("Session ready");
+    });
 
     socket.on("processing_error", (payload) => {
       setStatusMessage(payload?.message || "Processing error");
     });
 
+    socket.on("audio_start", async () => {
+      const audioCtx = await ensureAudioContext();
+      stopOutputPlayback();
+      playheadTimeRef.current = audioCtx.currentTime;
+      setStatusMessage("Playing response");
+    });
+
+    socket.on("audio", ({ data }) => {
+      void schedulePlayback(data.audio);
+    });
+
+    socket.on("audio_end", () => {
+      // stopOutputPlayback();
+      setStatusMessage("Output finished");
+    });
+
     return () => {
       socket.removeAllListeners();
       socket.disconnect();
-      cleanupMedia();
-      resetPlayback();
+      cleanupInput();
+      stopOutputPlayback();
       void resetAudioContext();
     };
-  }, [cleanupMedia, handleAudioEvent, resetAudioContext, resetPlayback]);
+  }, [
+    cleanupInput,
+    ensureAudioContext,
+    resetAudioContext,
+    schedulePlayback,
+    stopOutputPlayback,
+  ]);
 
-  const startHoldingToTalk = async () => {
+  const startHoldingToTalk = useCallback(async () => {
     if (isHolding) return;
     if (!socketRef.current || !socketConnected) {
       setStatusMessage("Socket not connected");
@@ -222,89 +267,65 @@ function App() {
     }
 
     try {
-      pendingChunksRef.current = 0;
-      endRequestedRef.current = false;
+      const audioCtx = await ensureAudioContext();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      micStreamRef.current = stream;
 
-      const recorder = new MediaRecorder(stream, {
-        mimeType: "audio/webm;codecs=opus",
-      });
-      mediaRecorderRef.current = recorder;
+      const source = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(2048, 1, 1);
+      sourceNodeRef.current = source;
+      processorNodeRef.current = processor;
 
-      recorder.ondataavailable = async (event) => {
-        if (event.data.size <= 0) return;
-        try {
-          pendingChunksRef.current += 1;
-          const base64 = await blobToBase64(event.data);
-          socketRef.current?.emit("audio_chunk", { data: base64 });
-        } catch (err) {
-          console.error("Failed to encode audio chunk", err);
-        } finally {
-          pendingChunksRef.current = Math.max(0, pendingChunksRef.current - 1);
-          tryEmitEndStream();
-        }
+      pendingSegmentsRef.current = [];
+      pendingSamplesRef.current = 0;
+      isSendingInputRef.current = true;
+
+      processor.onaudioprocess = (event) => {
+        if (!isSendingInputRef.current) return;
+        const input = event.inputBuffer.getChannelData(0);
+        const down = downsample(input, audioCtx.sampleRate, SAMPLE_RATE);
+        const pcm16 = floatTo16BitPCM(down);
+        pendingSegmentsRef.current.push(pcm16);
+        pendingSamplesRef.current += pcm16.length;
+        drainInputChunks(false);
       };
 
-      recorder.onstop = () => {
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((track) => track.stop());
-          streamRef.current = null;
-        }
-        mediaRecorderRef.current = null;
-        setIsHolding(false);
-        tryEmitEndStream();
-      };
-
-      recorder.onerror = (err) => {
-        console.error("Recorder error", err);
-        setStatusMessage("Recorder error");
-      };
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
 
       socketRef.current.emit("start_stream");
       setIsHolding(true);
-      setStatusMessage("Streaming audio...");
-      if (!audioContextRef.current) {
-        audioContextRef.current = new AudioContext({
-          sampleRate: AUDIO_SAMPLE_RATE,
-        });
-      }
-      await audioContextRef.current.resume();
-      recorder.start(2000);
+      setStatusMessage("Streaming microphone audio");
     } catch (err) {
       console.error("Microphone unavailable", err);
       setStatusMessage("Microphone unavailable");
-      cleanupMedia();
+      cleanupInput();
     }
-  };
+  }, [
+    cleanupInput,
+    drainInputChunks,
+    ensureAudioContext,
+    isHolding,
+    socketConnected,
+  ]);
 
-  const stopHoldingToTalk = () => {
+  const stopHoldingToTalk = useCallback(() => {
     if (!isHolding) return;
-    endRequestedRef.current = true;
+    isSendingInputRef.current = false;
+    drainInputChunks(true);
+    socketRef.current?.emit("end_stream");
+    setStatusMessage("Stream ended");
+    cleanupInput();
+  }, [cleanupInput, drainInputChunks, isHolding]);
 
-    if (mediaRecorderRef.current) {
-      try {
-        if (mediaRecorderRef.current.state !== "inactive") {
-          mediaRecorderRef.current.stop();
-        }
-      } catch {
-        // ignore
-      }
-    } else {
-      cleanupMedia();
-      tryEmitEndStream();
-    }
-  };
-
-  const resetStream = async () => {
-    cleanupMedia();
-    resetPlayback();
-    conversationIdRef.current = null;
+  const resetStream = useCallback(async () => {
+    cleanupInput();
+    stopOutputPlayback();
     setConversationId(null);
     setStatusMessage("Reset");
-    socketRef.current?.emit("reset_stream");
+    socketRef.current?.emit("reset_session");
     await resetAudioContext();
-  };
+  }, [cleanupInput, resetAudioContext, stopOutputPlayback]);
 
   return (
     <div className="app-shell">
@@ -344,20 +365,20 @@ function App() {
           <div className="action-row">
             <button
               className={`mic-button ${isHolding ? "active" : ""}`}
-              onMouseDown={startHoldingToTalk}
-              onMouseUp={stopHoldingToTalk}
-              onMouseLeave={stopHoldingToTalk}
-              onTouchStart={(e) => {
+              onPointerDown={(e) => {
                 e.preventDefault();
+                e.currentTarget.setPointerCapture?.(e.pointerId);
                 startHoldingToTalk();
               }}
-              onTouchEnd={(e) => {
+              onPointerUp={(e) => {
                 e.preventDefault();
                 stopHoldingToTalk();
+                e.currentTarget.releasePointerCapture?.(e.pointerId);
               }}
-              onTouchCancel={(e) => {
+              onPointerCancel={(e) => {
                 e.preventDefault();
                 stopHoldingToTalk();
+                e.currentTarget.releasePointerCapture?.(e.pointerId);
               }}
               disabled={!socketConnected}
             >
