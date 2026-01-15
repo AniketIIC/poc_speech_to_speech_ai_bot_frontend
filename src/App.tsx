@@ -61,6 +61,15 @@ const int16ToBase64 = (input: Int16Array) => {
   return arrayBufferToBase64(buffer);
 };
 
+const getConversationId = (payload: unknown): string | null => {
+  if (!payload || typeof payload !== "object") return null;
+  const casted = payload as {
+    conversationId?: string | null;
+    data?: { conversationId?: string | null };
+  };
+  return casted.conversationId ?? casted.data?.conversationId ?? null;
+};
+
 function App() {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [socketConnected, setSocketConnected] = useState(false);
@@ -68,6 +77,7 @@ function App() {
   const [statusMessage, setStatusMessage] = useState("Idle");
 
   const socketRef = useRef<Socket | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -205,12 +215,22 @@ function App() {
       setSocketConnected(false);
       setStatusMessage("Disconnected");
       setConversationId(null);
+      conversationIdRef.current = null;
       cleanupInput();
       stopOutputPlayback();
     });
 
     socket.on("new_conversation", ({ data }) => {
       const nextConversation = data?.conversationId ?? null;
+      if (!nextConversation) {
+        conversationIdRef.current = null;
+        setConversationId(null);
+        setStatusMessage("Awaiting conversation id");
+        stopOutputPlayback();
+        return;
+      }
+
+      conversationIdRef.current = nextConversation;
       setConversationId(nextConversation);
       setStatusMessage(
         nextConversation
@@ -228,18 +248,39 @@ function App() {
       setStatusMessage(payload?.message || "Processing error");
     });
 
-    socket.on("audio_start", async () => {
-      const audioCtx = await ensureAudioContext();
-      stopOutputPlayback();
-      playheadTimeRef.current = audioCtx.currentTime;
-      setStatusMessage("Playing response");
+    socket.on("audio_start", async (payload) => {
+      // const incomingConversationId = getConversationId(payload);
+      // if (
+      //   !incomingConversationId ||
+      //   incomingConversationId !== conversationIdRef.current
+      // ) {
+      //   return;
+      // }
+      // const audioCtx = await ensureAudioContext();
+      // stopOutputPlayback();
+      // playheadTimeRef.current = audioCtx.currentTime;
+      // setStatusMessage("Playing response");
     });
 
     socket.on("audio", ({ data }) => {
+      const incomingConversationId = getConversationId(data);
+      if (
+        !incomingConversationId ||
+        incomingConversationId !== conversationIdRef.current
+      ) {
+        return;
+      }
       void schedulePlayback(data.audio);
     });
 
-    socket.on("audio_end", () => {
+    socket.on("audio_end", (payload) => {
+      // const incomingConversationId = getConversationId(payload);
+      // if (
+      //   !incomingConversationId ||
+      //   incomingConversationId !== conversationIdRef.current
+      // ) {
+      //   return;
+      // }
       // stopOutputPlayback();
       setStatusMessage("Output finished");
     });
@@ -322,6 +363,7 @@ function App() {
     cleanupInput();
     stopOutputPlayback();
     setConversationId(null);
+    conversationIdRef.current = null;
     setStatusMessage("Reset");
     socketRef.current?.emit("reset_session");
     await resetAudioContext();
